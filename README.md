@@ -4,6 +4,52 @@ Rust gateway for content-addressed audio transcription. The service stores
 audio and transcript files on local disk. SQLite provides lookup and a durable
 job queue. One in-process worker sends jobs to a separate WhisperX VM.
 
+## Architecture
+
+The gateway runs one HTTP API and one in-process worker on the same VM.
+SQLite stores lookup metadata and the job queue. Local disk stores audio and
+transcript files. WhisperX runs on a separate VM and transcribes one job at a
+time.
+
+```mermaid
+flowchart TB
+  Client[Client]
+
+  subgraph Gateway["Transcription gateway"]
+    API[HTTP API]
+    Worker[Worker task]
+  end
+
+  SQLite[(SQLite lookup.db)]
+  Disk[("Local disk (DATA_DIR)")]
+  WhisperX[WhisperX VM]
+
+  Client -->|"POST /v1/audio/lookup"| API
+  Client -->|"POST /v1/audio/transcriptions"| API
+  Client -->|"GET /v1/jobs/{job_id}"| API
+  Client -->|"GET /v1/jobs/{job_id}/events (SSE)"| API
+
+  API --> SQLite
+  API --> Disk
+  Worker --> SQLite
+  Worker --> Disk
+  Worker -->|"POST /v1/audio/transcriptions"| WhisperX
+  Worker -->|"GET /v1/progress"| WhisperX
+```
+
+Lookup flow:
+
+1. The client sends a hash to the lookup endpoint.
+2. The gateway checks SQLite for a ready row with that hash, model, and
+   requested language.
+3. On a hit, the gateway reads the transcript JSON from disk and returns it.
+4. On a miss, the client uploads the audio file.
+5. The gateway writes `audio/{sha256}.{extension}` and inserts a pending row.
+6. The worker claims the row, sends the file to WhisperX, and polls progress.
+7. On success, the worker writes
+   `transcripts/{sha256}/{model}/{language-or-auto}.json`, stores the
+   detected language in SQLite, and marks the job ready.
+
 ## Requirements
 
 - Rust 1.97 or later
