@@ -6,49 +6,92 @@ job queue. One in-process worker sends jobs to a separate WhisperX VM.
 
 ## Architecture
 
-The gateway runs one HTTP API and one in-process worker on the same VM.
-SQLite stores lookup metadata and the job queue. Local disk stores audio and
-transcript files. WhisperX runs on a separate VM and transcribes one job at a
-time.
+The gateway runs on a second VM. WhisperX stays a separate worker on its own
+VM. SQLite stores lookup metadata and the job queue. Local disk stores audio and
+transcript files.
+
+### Topology
 
 ```mermaid
-flowchart TB
-  Client[Client]
-
-  subgraph Gateway["Transcription gateway"]
-    API[HTTP API]
-    Worker[Worker task]
+flowchart LR
+  Client --> gatewayVm
+  subgraph gatewayVm [Gateway VM]
+    Axum[Axum API]
+    Worker[Tokio worker]
+    SQLite[(SQLite lookup.db)]
+    Files[audio and transcript files]
+    Axum --> SQLite
+    Axum --> Files
+    Worker --> SQLite
+    Worker --> Files
   end
-
-  SQLite[(SQLite lookup.db)]
-  Disk[("Local disk (DATA_DIR)")]
-  WhisperX[WhisperX VM]
-
-  Client -->|"POST /v1/audio/lookup"| API
-  Client -->|"POST /v1/audio/transcriptions"| API
-  Client -->|"GET /v1/jobs/{job_id}"| API
-  Client -->|"GET /v1/jobs/{job_id}/events (SSE)"| API
-
-  API --> SQLite
-  API --> Disk
-  Worker --> SQLite
-  Worker --> Disk
-  Worker -->|"POST /v1/audio/transcriptions"| WhisperX
-  Worker -->|"GET /v1/progress"| WhisperX
+  Worker -->|POST multipart| whisperxVm
+  Worker -->|GET /v1/progress| whisperxVm
+  subgraph whisperxVm [WhisperX VM]
+    WhisperX[server.py :8000]
+  end
 ```
 
-Lookup flow:
+The gateway VM must reach the WhisperX host on port `8000`. Clients talk only
+to the gateway.
 
-1. The client sends a hash to the lookup endpoint.
-2. The gateway checks SQLite for a ready row with that hash, model, and
-   requested language.
-3. On a hit, the gateway reads the transcript JSON from disk and returns it.
-4. On a miss, the client uploads the audio file.
-5. The gateway writes `audio/{sha256}.{extension}` and inserts a pending row.
-6. The worker claims the row, sends the file to WhisperX, and polls progress.
-7. On success, the worker writes
-   `transcripts/{sha256}/{model}/{language-or-auto}.json`, stores the
-   detected language in SQLite, and marks the job ready.
+### Hash-first flow
+
+```mermaid
+sequenceDiagram
+  participant Client
+  participant Gateway
+  participant Lookup as SQLite
+  participant Store as LocalFiles
+  participant WhisperX
+
+  Client->>Client: SHA-256 of audio bytes
+  Client->>Gateway: POST /v1/audio/lookup
+  Gateway->>Lookup: select by hash, model, requested_language
+  alt ready
+    Lookup-->>Gateway: audio_path and transcript_path
+    Gateway->>Store: read transcript JSON
+    Gateway-->>Client: 200 transcription
+  else pending or processing
+    Gateway-->>Client: 202 job id
+  else failed
+    Gateway-->>Client: 500 error
+  else missing
+    Gateway-->>Client: 404
+    Client->>Gateway: POST /v1/audio/transcriptions
+    Gateway->>Gateway: hash upload and verify
+    Gateway->>Store: write audio/{sha256}.{ext}
+    Gateway->>Lookup: insert pending or join existing job
+    alt wait=true on upload
+      Gateway-->>Client: SSE status stream
+    else poll or GET /v1/jobs/{job_id}/events
+      Gateway-->>Client: 202 job id or SSE events
+    end
+    Note over Gateway,Lookup: worker claims pending rows asynchronously
+    Gateway->>Lookup: claim pending row
+    Gateway->>Store: read audio
+    Gateway->>WhisperX: POST /v1/audio/transcriptions
+    WhisperX-->>Gateway: verbose_json
+    Gateway->>Store: write transcripts/{sha256}/{model}/{lang-or-auto}.json
+    Gateway->>Lookup: set paths, detected language, status ready
+    Client->>Gateway: GET /v1/jobs/{job_id}
+    Gateway-->>Client: 200 transcription
+  end
+```
+
+Uploading the same hash again requeues a failed row. The SSE stream from
+`wait=true` does not include the transcript. After the stream closes on
+`ready`, call `GET /v1/jobs/{job_id}`.
+
+### Why two stores
+
+- **SQLite:** small rows keyed by `(content_sha256, model, requested_language)`.
+  Fast existence check. Holds status and file paths only.
+- **Local files:** the audio bytes and the transcript JSON. The lookup row is
+  complete only after both paths exist.
+
+Do not put audio bytes in SQLite. Store the file first. Pending rows form the
+queue.
 
 ## Requirements
 
