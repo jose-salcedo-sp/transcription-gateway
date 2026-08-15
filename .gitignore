@@ -1,4 +1,6 @@
 /target
 .env
 /data
-.DS_Store
+
+# macOS
+**/.DS_Store
