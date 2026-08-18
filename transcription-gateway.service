@@ -8,6 +8,7 @@ Type=simple
 User=@USER@
 WorkingDirectory=@SERVICE_DIR@
 EnvironmentFile=@SERVICE_DIR@/.env
+Environment=RUST_LOG=info,transcription_gateway=info,tower_http=warn
 ExecStart=@SERVICE_DIR@/target/release/transcription-gateway
 Restart=on-failure
 RestartSec=3

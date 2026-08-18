@@ -26,7 +26,8 @@ use tokio::{
     sync::Notify,
     time::{Duration, sleep},
 };
-use tower_http::trace::TraceLayer;
+use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
+use tracing::Level;
 use uuid::Uuid;
 
 use crate::{
@@ -90,7 +91,11 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .merge(protected)
         .merge(worker)
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                .on_response(DefaultOnResponse::new().level(Level::INFO)),
+        )
         .with_state(state)
 }
 
@@ -122,11 +127,27 @@ async fn lookup(
         Some(record) if record.status == "failed" => {
             db::requeue_failed(&state.pool, &record.job_id, expires_at).await?;
             state.jobs_changed.notify_waiters();
-            db::find_by_job_id(&state.pool, &record.job_id)
+            let record = db::find_by_job_id(&state.pool, &record.job_id)
                 .await?
-                .ok_or_else(|| AppError::Internal(anyhow::anyhow!("requeued job disappeared")))?
+                .ok_or_else(|| AppError::Internal(anyhow::anyhow!("requeued job disappeared")))?;
+            tracing::info!(
+                job_id = %record.job_id,
+                sha256 = %hash_prefix(&request.sha256),
+                model = %request.model,
+                language = %request.language,
+                "lookup requeued failed job for upload"
+            );
+            record
         }
-        Some(record) => record,
+        Some(record) => {
+            tracing::info!(
+                job_id = %record.job_id,
+                sha256 = %hash_prefix(&request.sha256),
+                status = %record.status,
+                "lookup hit"
+            );
+            record
+        }
         None => {
             let job_id = Uuid::new_v4().to_string();
             let inserted = db::insert_awaiting_upload(
@@ -150,9 +171,18 @@ async fn lookup(
                 .await?
             };
             state.jobs_changed.notify_waiters();
-            record.ok_or_else(|| {
+            let record = record.ok_or_else(|| {
                 AppError::Internal(anyhow::anyhow!("created or conflicting job disappeared"))
-            })?
+            })?;
+            tracing::info!(
+                job_id = %record.job_id,
+                sha256 = %hash_prefix(&request.sha256),
+                model = %request.model,
+                language = %request.language,
+                inserted,
+                "lookup miss created job"
+            );
+            record
         }
     };
     record_response(&state, record, "verbose_json").await
@@ -181,13 +211,22 @@ async fn job_events(
     db::find_by_job_id(&state.pool, &job_id)
         .await?
         .ok_or_else(|| AppError::NotFound("job not found".into()))?;
+    tracing::info!(job_id = %job_id, "status stream opened");
     Ok(job_status_sse(state, job_id))
 }
 
 async fn claim(State(state): State<AppState>) -> Result<Response, AppError> {
     let Some(record) = db::claim_next(&state.pool).await? else {
+        tracing::debug!("worker claim: queue empty");
         return Ok(StatusCode::NO_CONTENT.into_response());
     };
+    tracing::info!(
+        job_id = %record.job_id,
+        sha256 = %hash_prefix(&record.content_sha256),
+        model = %record.model,
+        language = %record.requested_language,
+        "worker claimed job"
+    );
     state.jobs_changed.notify_waiters();
     Ok(Json(ClaimedJob {
         job_id: record.job_id,
@@ -213,10 +252,12 @@ async fn audio_ready(
         if !db::mark_audio_ready(&state.pool, &job_id).await? {
             return Err(AppError::Conflict("job status changed".into()));
         }
+        tracing::info!(job_id = %job_id, sha256 = %hash_prefix(&request.sha256), "audio ready");
         state.jobs_changed.notify_waiters();
         return Ok(StatusCode::NO_CONTENT);
     }
     if matches!(record.status.as_str(), "pending" | "processing" | "ready") {
+        tracing::debug!(job_id = %job_id, status = %record.status, "audio-ready callback ignored");
         return Ok(StatusCode::NO_CONTENT);
     }
     Err(AppError::Conflict(format!(
@@ -234,6 +275,7 @@ async fn result(
         .await?
         .ok_or_else(|| AppError::NotFound("job not found".into()))?;
     if record.status == "ready" {
+        tracing::debug!(job_id = %job_id, "duplicate result ignored");
         return Ok(StatusCode::NO_CONTENT);
     }
     if record.status != "processing" {
@@ -284,6 +326,13 @@ async fn result(
     .await?;
     state.progress.clear(&job_id);
     state.jobs_changed.notify_waiters();
+    tracing::info!(
+        job_id = %job_id,
+        sha256 = %hash_prefix(&record.content_sha256),
+        duration_seconds = ?duration,
+        language = ?language,
+        "transcript stored"
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -307,8 +356,14 @@ async fn fail(
         }
         let expires_at = unix_timestamp() + UPLOAD_TTL_SECONDS;
         db::return_to_awaiting_upload(&state.pool, &job_id, expires_at).await?;
+        tracing::info!(
+            job_id = %job_id,
+            reason = %request.reason,
+            "job returned to awaiting upload"
+        );
     } else if request.reason == "transcription_failed" {
         if record.status == "failed" {
+            tracing::debug!(job_id = %job_id, "duplicate fail ignored");
             return Ok(StatusCode::NO_CONTENT);
         }
         if record.status != "processing" {
@@ -323,6 +378,12 @@ async fn fail(
             &request.error.chars().take(2_000).collect::<String>(),
         )
         .await?;
+        tracing::info!(
+            job_id = %job_id,
+            reason = %request.reason,
+            error = %request.error,
+            "job failed"
+        );
     } else {
         return Err(AppError::BadRequest("unknown failure reason".into()));
     }
@@ -531,6 +592,10 @@ fn upload_expired(record: &Transcription) -> bool {
         && record
             .upload_expires_at
             .is_some_and(|expires_at| expires_at <= unix_timestamp())
+}
+
+fn hash_prefix(sha256: &str) -> &str {
+    &sha256[..sha256.len().min(8)]
 }
 
 fn unix_timestamp() -> i64 {

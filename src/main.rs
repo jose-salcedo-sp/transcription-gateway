@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tokio::{net::TcpListener, signal, sync::Notify};
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use crate::{
     api::{AppState, router},
@@ -20,7 +21,14 @@ use crate::{
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::registry()
+        .with(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                EnvFilter::new("info,transcription_gateway=info,tower_http=warn")
+            }),
+        )
+        .with(fmt::layer())
+        .init();
 
     let config = Arc::new(Config::from_env()?);
     db::prepare_data_dirs(&config.data_dir).await?;
