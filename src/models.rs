@@ -56,6 +56,7 @@ pub struct Transcription {
     pub transcript_path: Option<String>,
     pub duration_seconds: Option<f64>,
     pub error: Option<String>,
+    pub upload_expires_at: Option<i64>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -89,6 +90,12 @@ pub struct JobResponse {
     pub elapsed_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_expires_at: Option<i64>,
 }
 
 impl JobResponse {
@@ -113,6 +120,14 @@ impl JobResponse {
                     ..LiveProgress::default()
                 };
             }
+            "awaiting_upload" => {
+                live = LiveProgress {
+                    stage: Some("awaiting_upload".into()),
+                    progress_percent: Some(0),
+                    message: Some("Waiting for audio".into()),
+                    ..LiveProgress::default()
+                };
+            }
             _ => {}
         }
         Self {
@@ -133,6 +148,9 @@ impl JobResponse {
             audio_seconds: live.audio_seconds,
             elapsed_ms: live.elapsed_ms,
             error: record.error.clone(),
+            upload_url: None,
+            upload_token: None,
+            upload_expires_at: None,
         }
     }
 }
@@ -199,6 +217,7 @@ mod tests {
             transcript_path: None,
             duration_seconds: None,
             error: None,
+            upload_expires_at: None,
             created_at: String::new(),
             updated_at: String::new(),
         };
@@ -214,6 +233,12 @@ mod tests {
         assert_eq!(pending.progress_percent, Some(0));
         assert_eq!(pending.stage.as_deref(), Some("queued"));
         assert_eq!(pending.queue_position, Some(2));
+
+        record.status = "awaiting_upload".into();
+        let awaiting = JobResponse::from_record(&record, None, None);
+        assert_eq!(awaiting.stage.as_deref(), Some("awaiting_upload"));
+        assert_eq!(awaiting.message.as_deref(), Some("Waiting for audio"));
+        assert_eq!(awaiting.queue_position, None);
 
         record.status = "processing".into();
         let unknown = JobResponse::from_record(&record, None, Some(1));

@@ -29,9 +29,6 @@ pub async fn connect(database_url: &str) -> Result<SqlitePool> {
 }
 
 pub async fn prepare_data_dirs(data_dir: &Path) -> Result<()> {
-    tokio::fs::create_dir_all(data_dir.join("audio"))
-        .await
-        .context("cannot create audio directory")?;
     tokio::fs::create_dir_all(data_dir.join("transcripts"))
         .await
         .context("cannot create transcript directory")?;
@@ -68,40 +65,89 @@ pub async fn find_by_job_id(
         .await
 }
 
-pub async fn insert_pending(
+pub async fn insert_awaiting_upload(
     pool: &SqlitePool,
     job_id: &str,
     sha256: &str,
     model: &str,
     language: &str,
-    audio_path: &str,
+    upload_expires_at: i64,
 ) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
         "INSERT INTO transcriptions
-            (job_id, content_sha256, model, requested_language, status, audio_path)
-         VALUES (?, ?, ?, ?, 'pending', ?)
+            (job_id, content_sha256, model, requested_language, status, upload_expires_at)
+         VALUES (?, ?, ?, ?, 'awaiting_upload', ?)
          ON CONFLICT(content_sha256, model, requested_language) DO NOTHING",
     )
     .bind(job_id)
     .bind(sha256)
     .bind(model)
     .bind(language)
-    .bind(audio_path)
+    .bind(upload_expires_at)
     .execute(pool)
     .await?;
     Ok(result.rows_affected() == 1)
 }
 
-pub async fn requeue_failed(pool: &SqlitePool, job_id: &str) -> Result<bool, sqlx::Error> {
+pub async fn requeue_failed(
+    pool: &SqlitePool,
+    job_id: &str,
+    upload_expires_at: i64,
+) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
         "UPDATE transcriptions
-         SET status = 'pending', error = NULL, updated_at = datetime('now')
+         SET status = 'awaiting_upload', error = NULL, upload_expires_at = ?,
+             updated_at = datetime('now')
          WHERE job_id = ? AND status = 'failed'",
+    )
+    .bind(upload_expires_at)
+    .bind(job_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+pub async fn mark_audio_ready(pool: &SqlitePool, job_id: &str) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE transcriptions
+         SET status = 'pending', upload_expires_at = NULL, error = NULL,
+             updated_at = datetime('now')
+         WHERE job_id = ? AND status = 'awaiting_upload'",
     )
     .bind(job_id)
     .execute(pool)
     .await?;
     Ok(result.rows_affected() == 1)
+}
+
+pub async fn return_to_awaiting_upload(
+    pool: &SqlitePool,
+    job_id: &str,
+    upload_expires_at: i64,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE transcriptions
+         SET status = 'awaiting_upload', upload_expires_at = ?, error = NULL,
+             updated_at = datetime('now')
+         WHERE job_id = ? AND status = 'processing'",
+    )
+    .bind(upload_expires_at)
+    .bind(job_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+pub async fn expire_uploads(pool: &SqlitePool, now: i64) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE transcriptions
+         SET status = 'failed', error = 'upload expired', updated_at = datetime('now')
+         WHERE status = 'awaiting_upload' AND upload_expires_at <= ?",
+    )
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
 }
 
 pub async fn reset_processing(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
@@ -126,6 +172,17 @@ pub async fn claim_next(pool: &SqlitePool) -> Result<Option<Transcription>, sqlx
              LIMIT 1
          )
          RETURNING *",
+    )
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn find_processing(pool: &SqlitePool) -> Result<Option<Transcription>, sqlx::Error> {
+    sqlx::query_as::<_, Transcription>(
+        "SELECT * FROM transcriptions
+         WHERE status = 'processing'
+         ORDER BY updated_at
+         LIMIT 1",
     )
     .fetch_optional(pool)
     .await
@@ -188,34 +245,37 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        claim_next, connect, find_by_job_id, find_by_key, insert_pending, mark_ready,
-        pending_position, reset_processing,
+        claim_next, connect, find_by_job_id, find_by_key, insert_awaiting_upload, mark_audio_ready,
+        mark_ready, pending_position, reset_processing,
     };
 
     #[tokio::test]
-    async fn stores_claims_and_completes_a_job() {
+    async fn waits_for_audio_before_claim_and_completion() {
         let directory = tempdir().unwrap();
         let database_url = format!("sqlite://{}", directory.path().join("test.db").display());
         let pool = connect(&database_url).await.unwrap();
         let hash = "a".repeat(64);
 
         assert!(
-            insert_pending(&pool, "job-1", &hash, "whisper-1", "", "audio/file.m4a")
+            insert_awaiting_upload(&pool, "job-1", &hash, "whisper-1", "", 1_800_000_000)
                 .await
                 .unwrap()
         );
         assert!(
-            !insert_pending(&pool, "job-2", &hash, "whisper-1", "", "audio/file.m4a")
+            !insert_awaiting_upload(&pool, "job-2", &hash, "whisper-1", "", 1_800_000_000)
                 .await
                 .unwrap()
         );
+        assert!(claim_next(&pool).await.unwrap().is_none());
+        assert!(mark_audio_ready(&pool, "job-1").await.unwrap());
 
         let second_hash = "b".repeat(64);
         assert!(
-            insert_pending(&pool, "job-2", &second_hash, "whisper-1", "", "audio/b.m4a")
+            insert_awaiting_upload(&pool, "job-2", &second_hash, "whisper-1", "", 1_800_000_000)
                 .await
                 .unwrap()
         );
+        assert!(mark_audio_ready(&pool, "job-2").await.unwrap());
         assert_eq!(pending_position(&pool, "job-1").await.unwrap(), Some(1));
         assert_eq!(pending_position(&pool, "job-2").await.unwrap(), Some(2));
 

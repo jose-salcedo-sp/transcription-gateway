@@ -1,128 +1,89 @@
 # Transcription gateway
 
-Rust gateway for content-addressed audio transcription. The service stores
-audio and transcript files on local disk. SQLite provides lookup and a durable
-job queue. One in-process worker sends jobs to a separate WhisperX VM.
+Rust coordinator for content-addressed audio transcription. SQLite stores the
+job queue and lookup metadata. Local disk stores transcript JSON. Clients
+upload audio directly to a separate WhisperX server.
 
 ## Architecture
 
-The gateway runs on a second VM. WhisperX stays a separate worker on its own
-VM. SQLite stores lookup metadata and the job queue. Local disk stores audio and
-transcript files.
-
-### Topology
+The gateway is the only job coordinator. WhisperX accepts audio, stores it by
+SHA-256, and pulls work when its inference worker is idle.
 
 ```mermaid
 flowchart LR
-  Client --> gatewayVm
-  subgraph gatewayVm [Gateway VM]
-    Axum[Axum API]
-    Worker[Tokio worker]
-    SQLite[(SQLite lookup.db)]
-    Files[audio and transcript files]
-    Axum --> SQLite
-    Axum --> Files
-    Worker --> SQLite
-    Worker --> Files
-  end
-  Worker -->|POST multipart| whisperxVm
-  Worker -->|GET /v1/progress| whisperxVm
-  subgraph whisperxVm [WhisperX VM]
-    WhisperX[server.py :8000]
-  end
+  Client -->|hash lookup| Gateway
+  Gateway --> SQLite[(SQLite queue)]
+  Gateway --> Transcripts[Transcript files]
+  Gateway -->|signed upload URL| Client
+  Client -->|PUT audio| WhisperX
+  WhisperX -->|audio-ready callback| Gateway
+  WhisperX -->|claim next job| Gateway
+  WhisperX -->|result or failure| Gateway
+  Gateway -->|poll progress| WhisperX
 ```
 
-The gateway VM must reach the WhisperX host on port `8000`. Clients talk only
-to the gateway.
+Audio bytes never pass through the gateway. WhisperX and the gateway share an
+upload secret. The secret lets the gateway issue time-limited upload tokens
+without giving clients either service API key.
 
-### Hash-first flow
+## Job flow
 
-```mermaid
-sequenceDiagram
-  participant Client
-  participant Gateway
-  participant Lookup as SQLite
-  participant Store as LocalFiles
-  participant WhisperX
+1. The client calculates the lowercase SHA-256 of the original audio bytes.
+2. The client sends the hash to `POST /v1/audio/lookup`.
+3. A ready cache hit returns the transcript.
+4. An active cache hit returns the existing job status.
+5. A cache miss creates an `awaiting_upload` job and returns a signed WhisperX
+   upload URL.
+6. The client sends raw audio bytes to that URL with `PUT`.
+7. WhisperX verifies the token and hash, then calls the gateway
+   `audio-ready` route.
+8. The gateway changes the job to `pending`.
+9. An idle WhisperX worker claims the oldest pending job.
+10. WhisperX posts the transcript or a failure to the gateway.
+11. The client polls the job route or uses the SSE status stream.
 
-  Client->>Client: SHA-256 of audio bytes
-  Client->>Gateway: POST /v1/audio/lookup
-  Gateway->>Lookup: select by hash, model, requested_language
-  alt ready
-    Lookup-->>Gateway: audio_path and transcript_path
-    Gateway->>Store: read transcript JSON
-    Gateway-->>Client: 200 transcription
-  else pending or processing
-    Gateway-->>Client: 202 job id
-  else failed
-    Gateway-->>Client: 500 error
-  else missing
-    Gateway-->>Client: 404
-    Client->>Gateway: POST /v1/audio/transcriptions
-    Gateway->>Gateway: hash upload and verify
-    Gateway->>Store: write audio/{sha256}.{ext}
-    Gateway->>Lookup: insert pending or join existing job
-    alt wait=true on upload
-      Gateway-->>Client: SSE status stream
-    else poll or GET /v1/jobs/{job_id}/events
-      Gateway-->>Client: 202 job id or SSE events
-    end
-    Note over Gateway,Lookup: worker claims pending rows asynchronously
-    Gateway->>Lookup: claim pending row
-    Gateway->>Store: read audio
-    Gateway->>WhisperX: POST /v1/audio/transcriptions
-    WhisperX-->>Gateway: verbose_json
-    Gateway->>Store: write transcripts/{sha256}/{model}/{lang-or-auto}.json
-    Gateway->>Lookup: set paths, detected language, status ready
-    Client->>Gateway: GET /v1/jobs/{job_id}
-    Gateway-->>Client: 200 transcription
-  end
+The status sequence is:
+
+```text
+awaiting_upload -> pending -> processing -> ready
+                                      \-> failed
+failed -> awaiting_upload
+processing -> pending (gateway restart recovery)
 ```
 
-Uploading the same hash again requeues a failed row. The SSE stream from
-`wait=true` does not include the transcript. After the stream closes on
-`ready`, call `GET /v1/jobs/{job_id}`.
-
-### Why two stores
-
-- **SQLite:** small rows keyed by `(content_sha256, model, requested_language)`.
-  Fast existence check. Holds status and file paths only.
-- **Local files:** the audio bytes and the transcript JSON. The lookup row is
-  complete only after both paths exist.
-
-Do not put audio bytes in SQLite. Store the file first. Pending rows form the
-queue.
+An upload token expires after two hours. The gateway changes an abandoned
+`awaiting_upload` job to `failed`. A later hash lookup creates a new upload
+token for the same job.
 
 ## Requirements
 
 - Rust 1.97 or later
-- A persistent disk for `DATA_DIR`
-- Network access from this VM to the WhisperX API (`WHISPERX_BASE_URL`)
+- Persistent storage for `DATA_DIR`
+- Network access from the gateway to WhisperX
+- Matching `GATEWAY_WORKER_KEY` and `WHISPERX_UPLOAD_SECRET` values on both
+  services
 
 ## Configure
+
+Copy the example:
 
 ```bash
 cp .env.example .env
 ```
 
-Set both API keys. `GATEWAY_API_KEY` authenticates clients.
-`WHISPERX_API_KEY` authenticates the gateway to WhisperX. On OrbStack, set
-`WHISPERX_BASE_URL` to `http://whisperx.orb.local:8000`.
+Set:
 
-The defaults create these paths:
+- `GATEWAY_API_KEY`: Authenticates client lookup and job requests.
+- `GATEWAY_WORKER_KEY`: Authenticates WhisperX claims and callbacks.
+- `WHISPERX_BASE_URL`: Internal WhisperX URL used for progress polling.
+- `WHISPERX_PUBLIC_BASE_URL`: WhisperX URL that clients use for upload.
+- `WHISPERX_API_KEY`: Authenticates gateway progress requests.
+- `WHISPERX_UPLOAD_SECRET`: Signs upload tokens. Use the same value on
+  WhisperX.
+- `DATA_DIR`: Contains `lookup.db`, `tmp/`, and `transcripts/`.
+- `DATABASE_URL`: Optional SQLite URL. The default uses `DATA_DIR/lookup.db`.
 
-```text
-data/
-├── audio/
-├── lookup.db
-├── tmp/
-└── transcripts/
-```
-
-The service enables SQLite WAL mode and applies migrations at startup.
-Audio files use `audio/{sha256}.{extension}`. Transcript files use
-`transcripts/{sha256}/{model}/{language-or-auto}.json` to keep cache variants
-separate.
+Use different values for `GATEWAY_API_KEY` and `GATEWAY_WORKER_KEY`.
 
 ## Run
 
@@ -130,80 +91,19 @@ separate.
 cargo run --release
 ```
 
-The gateway listens on `0.0.0.0:8080` by default. Port `8000` is WhisperX.
-Send client traffic to the gateway, not to WhisperX.
+The gateway listens on `0.0.0.0:8080` by default.
 
-## Hash-first client flow
+## Client API
 
-Calculate lowercase SHA-256 from the original file bytes:
+All `/v1` client routes require:
 
-```bash
-HASH=$(shasum -a 256 note.m4a | awk '{print $1}')
+```text
+Authorization: Bearer {GATEWAY_API_KEY}
 ```
-
-Check the lookup before uploading:
-
-```bash
-curl -sS http://gateway:8080/v1/audio/lookup \
-  -H "Authorization: Bearer $GATEWAY_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d "{\"sha256\":\"$HASH\",\"model\":\"whisper-1\"}"
-```
-
-The lookup returns:
-
-- `200` with the stored transcription when the job is ready.
-- `202` with a job ID and status when the job is pending or processing.
-- `404` when the gateway does not have the hash. Upload the file to create a job.
-
-A `202` body includes `queue_position` while the job is queued. While WhisperX
-runs, the body also includes `stage`, `progress_percent`, `message`,
-`language`, `audio_seconds`, and `elapsed_ms` from WhisperX
-`GET /v1/progress`.
-
-Upload only after a `404`:
-
-```bash
-curl -sS http://gateway:8080/v1/audio/transcriptions \
-  -H "Authorization: Bearer $GATEWAY_API_KEY" \
-  -F "file=@note.m4a" \
-  -F "sha256=$HASH" \
-  -F "model=whisper-1" \
-  -F "response_format=verbose_json"
-```
-
-The gateway always recalculates the hash. A mismatched client hash returns
-`400`. A new or in-progress job returns `202` immediately with a job ID in
-the JSON body and in the `x-job-id` header. A ready cache hit returns `200`
-with the transcript.
-
-`wait=true` keeps the upload connection open as an SSE status stream. The
-first event includes the job ID. After the stream closes on `ready`, call
-`GET /v1/jobs/{job_id}` for the transcript.
-
-Poll an asynchronous job:
-
-```bash
-curl -sS http://gateway:8080/v1/jobs/JOB_ID \
-  -H "Authorization: Bearer $GATEWAY_API_KEY"
-```
-
-Subscribe to live status events (preferred while a job runs):
-
-```bash
-curl -N -sS http://gateway:8080/v1/jobs/JOB_ID/events \
-  -H "Authorization: Bearer $GATEWAY_API_KEY"
-```
-
-## API
-
-### `GET /health`
-
-Returns gateway readiness. Authentication is not required.
 
 ### `POST /v1/audio/lookup`
 
-Accepts JSON:
+Request:
 
 ```json
 {
@@ -213,59 +113,114 @@ Accepts JSON:
 }
 ```
 
-`model` and `language` are optional. An omitted language means automatic
+`model` and `language` are optional. An omitted language enables automatic
 detection.
 
-### `POST /v1/audio/transcriptions`
+Responses:
 
-Accepts multipart fields:
+- `200`: Stored transcript.
+- `202`: The job needs an upload, is queued, or is processing.
+- `500`: The job failed.
 
-- `file`: Required audio file.
-- `sha256`: Optional client hash. The gateway verifies the value.
-- `model`: Optional. The only supported value is `whisper-1`.
-- `language`: Optional ISO language code.
-- `response_format`: `json`, `verbose_json`, or `text`.
-- `wait`: `true` or `1` to stream SSE status events until the job finishes.
+An `awaiting_upload` response includes:
 
-The worker always requests `verbose_json` from WhisperX. The gateway derives
-the smaller formats from the stored object. Because the worker uses
-`verbose_json`, WhisperX alignment occupies progress 72-96.
+```json
+{
+  "job_id": "uuid",
+  "status": "awaiting_upload",
+  "stage": "awaiting_upload",
+  "progress_percent": 0,
+  "message": "Waiting for audio",
+  "upload_url": "https://whisperx.example/v1/jobs/uuid/audio?sha256=...",
+  "upload_token": "expires.hmac",
+  "upload_expires_at": 1787030400
+}
+```
+
+Upload raw audio bytes directly to WhisperX:
+
+```bash
+curl -X PUT "$UPLOAD_URL" \
+  -H "Authorization: Bearer $UPLOAD_TOKEN" \
+  -H "Content-Type: audio/mp4" \
+  --data-binary @note.m4a
+```
 
 ### `GET /v1/jobs/{job_id}`
 
-Returns `202` while the job runs, the transcription after completion, or a
-failure object if transcription failed.
-
-A `202` body includes:
-
-- `job_id`
-- `status`: `pending` or `processing`
-- `queue_position`: 1-based place in the gateway queue. Present only when
-  `status` is `pending`.
-- `stage`, `progress_percent`, `message`, `language`, `audio_seconds`,
-  `elapsed_ms`: copied from WhisperX `GET /v1/progress` while the worker is
-  busy. These fields are omitted until WhisperX reports them.
-
-Queued jobs use `stage` `queued`, `progress_percent` `0`, and message
-`Queued`. Completed jobs use `progress_percent` `100`.
-
-WhisperX `stage` values are `receiving`, `loading_audio`, `transcribing`,
-`aligning`, and `finalizing`. `progress_percent` is an integer from 0 to 100
-and does not go backward during a job. `message` is short status-bar text.
+Returns `202` while the job is active, `200` with the transcript when ready,
+or `500` after failure.
 
 ### `GET /v1/jobs/{job_id}/events`
 
-Opens an SSE stream of `status` events until the job is `ready` or `failed`.
-Each event uses the same JSON object as a `202` job response. After the stream
-closes on `ready`, call `GET /v1/jobs/{job_id}` for the transcript.
+Streams SSE `status` events until the job is `ready` or `failed`. The stream
+does not include the transcript. Call the job route after a `ready` event.
 
-## Failure behavior
+## WhisperX worker API
 
-- The worker sends one job at a time.
-- A WhisperX `429` or connection error gets five exponential-backoff retries.
-- Failed rows keep their audio file.
-- Uploading the same hash again requeues a failed row.
-- At startup, the service returns interrupted `processing` rows to `pending`.
+All internal routes require:
 
-Back up `DATA_DIR` as one unit. The SQLite database contains relative paths to
-the files in that directory.
+```text
+Authorization: Bearer {GATEWAY_WORKER_KEY}
+```
+
+Clients must not use the internal routes.
+
+### `POST /v1/internal/jobs/{job_id}/audio-ready`
+
+Request:
+
+```json
+{"sha256": "64 lowercase hexadecimal characters"}
+```
+
+Changes a matching `awaiting_upload` job to `pending`. A repeated callback for
+a pending, processing, or ready job returns `204`.
+
+### `POST /v1/internal/worker/claim`
+
+Atomically claims the oldest pending job and changes it to `processing`.
+Returns `204` when the queue is empty.
+
+```json
+{
+  "job_id": "uuid",
+  "content_sha256": "64 lowercase hexadecimal characters",
+  "model": "whisper-1",
+  "requested_language": ""
+}
+```
+
+### `POST /v1/internal/jobs/{job_id}/result`
+
+Accepts a WhisperX `verbose_json` transcript. The gateway writes the
+transcript atomically and changes the job to `ready`.
+
+### `POST /v1/internal/jobs/{job_id}/fail`
+
+Request:
+
+```json
+{
+  "error": "error text",
+  "reason": "audio_missing"
+}
+```
+
+`audio_missing` returns a processing job to `awaiting_upload`.
+`transcription_failed` changes the job to `failed`.
+
+## Progress
+
+While a row is `processing`, the gateway polls WhisperX `GET /v1/progress`
+every 500 milliseconds. The gateway accepts a snapshot only when its `job_id`
+matches the processing row.
+
+## Operations
+
+Back up `DATA_DIR` as one unit. SQLite uses WAL mode. The gateway stores no
+audio files.
+
+One WhisperX worker still processes one file at a time. A high ingest rate can
+grow the queue and consume WhisperX disk. Plan WhisperX disk capacity from the
+pending job count and average audio size.

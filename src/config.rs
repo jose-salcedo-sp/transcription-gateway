@@ -12,9 +12,11 @@ pub struct Config {
     pub database_url: String,
     pub data_dir: PathBuf,
     pub gateway_api_key: String,
+    pub gateway_worker_key: String,
     pub whisperx_base_url: String,
+    pub whisperx_public_base_url: String,
     pub whisperx_api_key: String,
-    pub max_upload_bytes: usize,
+    pub whisperx_upload_secret: String,
 }
 
 impl Config {
@@ -30,24 +32,30 @@ impl Config {
             .unwrap_or_else(|_| "8080".into())
             .parse()
             .context("GATEWAY_PORT must be a port number")?;
-        let max_upload_mb = env::var("MAX_UPLOAD_MB")
-            .unwrap_or_else(|_| "1024".into())
-            .parse::<usize>()
-            .context("MAX_UPLOAD_MB must be a positive integer")?;
+        let whisperx_base_url = env::var("WHISPERX_BASE_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8000".into())
+            .trim_end_matches('/')
+            .to_owned();
+
+        let gateway_api_key = required("GATEWAY_API_KEY")?;
+        let gateway_worker_key = required("GATEWAY_WORKER_KEY")?;
+        if gateway_api_key == gateway_worker_key {
+            anyhow::bail!("GATEWAY_API_KEY and GATEWAY_WORKER_KEY must be different");
+        }
 
         Ok(Self {
             bind: SocketAddr::new(host, port),
             database_url,
             data_dir,
-            gateway_api_key: required("GATEWAY_API_KEY")?,
-            whisperx_base_url: env::var("WHISPERX_BASE_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:8000".into())
+            gateway_api_key,
+            gateway_worker_key,
+            whisperx_public_base_url: env::var("WHISPERX_PUBLIC_BASE_URL")
+                .unwrap_or_else(|_| whisperx_base_url.clone())
                 .trim_end_matches('/')
                 .to_owned(),
+            whisperx_base_url,
             whisperx_api_key: required("WHISPERX_API_KEY")?,
-            max_upload_bytes: max_upload_mb
-                .checked_mul(1024 * 1024)
-                .context("MAX_UPLOAD_MB is too large")?,
+            whisperx_upload_secret: required("WHISPERX_UPLOAD_SECRET")?,
         })
     }
 }

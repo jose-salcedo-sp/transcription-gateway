@@ -3,6 +3,7 @@ mod config;
 mod db;
 mod error;
 mod models;
+mod upload_token;
 mod worker;
 
 use std::sync::Arc;

@@ -13,9 +13,9 @@ pub enum AppError {
     #[error("invalid API key")]
     Unauthorized,
     #[error("{0}")]
-    PayloadTooLarge(String),
-    #[error("{0}")]
     NotFound(String),
+    #[error("{0}")]
+    Conflict(String),
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
@@ -25,8 +25,8 @@ impl IntoResponse for AppError {
         let (status, message) = match self {
             Self::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, self.to_string()),
-            Self::PayloadTooLarge(message) => (StatusCode::PAYLOAD_TOO_LARGE, message),
             Self::NotFound(message) => (StatusCode::NOT_FOUND, message),
+            Self::Conflict(message) => (StatusCode::CONFLICT, message),
             Self::Internal(error) => {
                 tracing::error!(?error, "request failed");
                 (

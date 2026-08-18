@@ -1,8 +1,12 @@
-use std::{convert::Infallible, path::PathBuf, sync::Arc};
+use std::{
+    convert::Infallible,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Multipart, Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{
         HeaderValue, Request, StatusCode,
         header::{AUTHORIZATION, HeaderName},
@@ -15,12 +19,10 @@ use axum::{
     },
     routing::{get, post},
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use tokio::{
-    fs::File,
-    io::AsyncWriteExt,
     sync::Notify,
     time::{Duration, sleep},
 };
@@ -31,10 +33,12 @@ use crate::{
     config::Config,
     db,
     error::AppError,
-    models::{
-        JobProgress, JobResponse, LookupRequest, PUBLIC_MODEL_ID, Transcription, validate_key,
-    },
+    models::{JobProgress, JobResponse, LookupRequest, Transcription, validate_key},
+    upload_token,
 };
+
+const UPLOAD_TTL_SECONDS: i64 = 2 * 60 * 60;
+const INTERNAL_BODY_LIMIT: usize = 64 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -44,32 +48,48 @@ pub struct AppState {
     pub progress: JobProgress,
 }
 
-struct Upload {
-    temp_path: PathBuf,
-    sha256: String,
-    supplied_sha256: Option<String>,
-    extension: String,
+#[derive(Debug, Serialize)]
+struct ClaimedJob {
+    job_id: String,
+    content_sha256: String,
     model: String,
-    language: String,
-    response_format: String,
-    wait: bool,
+    requested_language: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AudioReadyRequest {
+    sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FailRequest {
+    error: String,
+    reason: String,
 }
 
 pub fn router(state: AppState) -> Router {
-    let body_limit = state.config.max_upload_bytes.saturating_add(1024 * 1024);
     let protected = Router::new()
         .route("/v1/audio/lookup", post(lookup))
-        .route("/v1/audio/transcriptions", post(upload))
         .route("/v1/jobs/{job_id}", get(job))
         .route("/v1/jobs/{job_id}/events", get(job_events))
-        .layer(DefaultBodyLimit::max(body_limit))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_api_key,
         ));
+    let worker = Router::new()
+        .route("/v1/internal/worker/claim", post(claim))
+        .route("/v1/internal/jobs/{job_id}/audio-ready", post(audio_ready))
+        .route("/v1/internal/jobs/{job_id}/result", post(result))
+        .route("/v1/internal/jobs/{job_id}/fail", post(fail))
+        .layer(DefaultBodyLimit::max(INTERNAL_BODY_LIMIT))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_worker_key,
+        ));
     Router::new()
         .route("/health", get(health))
         .merge(protected)
+        .merge(worker)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -89,15 +109,51 @@ async fn lookup(
     validate_key(&request.sha256, &request.model, &request.language)
         .map_err(AppError::BadRequest)?;
 
-    let Some(record) = db::find_by_key(
+    db::expire_uploads(&state.pool, unix_timestamp()).await?;
+    let expires_at = unix_timestamp() + UPLOAD_TTL_SECONDS;
+    let record = match db::find_by_key(
         &state.pool,
         &request.sha256,
         &request.model,
         &request.language,
     )
     .await?
-    else {
-        return Err(AppError::NotFound("transcription not found".into()));
+    {
+        Some(record) if record.status == "failed" => {
+            db::requeue_failed(&state.pool, &record.job_id, expires_at).await?;
+            state.jobs_changed.notify_waiters();
+            db::find_by_job_id(&state.pool, &record.job_id)
+                .await?
+                .ok_or_else(|| AppError::Internal(anyhow::anyhow!("requeued job disappeared")))?
+        }
+        Some(record) => record,
+        None => {
+            let job_id = Uuid::new_v4().to_string();
+            let inserted = db::insert_awaiting_upload(
+                &state.pool,
+                &job_id,
+                &request.sha256,
+                &request.model,
+                &request.language,
+                expires_at,
+            )
+            .await?;
+            let record = if inserted {
+                db::find_by_job_id(&state.pool, &job_id).await?
+            } else {
+                db::find_by_key(
+                    &state.pool,
+                    &request.sha256,
+                    &request.model,
+                    &request.language,
+                )
+                .await?
+            };
+            state.jobs_changed.notify_waiters();
+            record.ok_or_else(|| {
+                AppError::Internal(anyhow::anyhow!("created or conflicting job disappeared"))
+            })?
+        }
     };
     record_response(&state, record, "verbose_json").await
 }
@@ -106,9 +162,15 @@ async fn job(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
 ) -> Result<Response, AppError> {
-    let record = db::find_by_job_id(&state.pool, &job_id)
+    let mut record = db::find_by_job_id(&state.pool, &job_id)
         .await?
         .ok_or_else(|| AppError::NotFound("job not found".into()))?;
+    if upload_expired(&record) {
+        db::expire_uploads(&state.pool, unix_timestamp()).await?;
+        record = db::find_by_job_id(&state.pool, &job_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound("job not found".into()))?;
+    }
     record_response(&state, record, "verbose_json").await
 }
 
@@ -122,212 +184,151 @@ async fn job_events(
     Ok(job_status_sse(state, job_id))
 }
 
-async fn upload(State(state): State<AppState>, multipart: Multipart) -> Result<Response, AppError> {
-    let upload = read_upload(&state, multipart).await?;
-
-    if let Some(supplied) = &upload.supplied_sha256
-        && supplied != &upload.sha256
-    {
-        let _ = tokio::fs::remove_file(&upload.temp_path).await;
-        return Err(AppError::BadRequest(
-            "supplied sha256 does not match the uploaded file".into(),
-        ));
-    }
-    if let Err(message) = validate_key(&upload.sha256, &upload.model, &upload.language) {
-        let _ = tokio::fs::remove_file(&upload.temp_path).await;
-        return Err(AppError::BadRequest(message));
-    }
-    if !matches!(
-        upload.response_format.as_str(),
-        "json" | "verbose_json" | "text"
-    ) {
-        let _ = tokio::fs::remove_file(&upload.temp_path).await;
-        return Err(AppError::BadRequest(
-            "response_format must be json, verbose_json, or text".into(),
-        ));
-    }
-
-    if let Some(record) =
-        db::find_by_key(&state.pool, &upload.sha256, &upload.model, &upload.language).await?
-    {
-        let _ = tokio::fs::remove_file(&upload.temp_path).await;
-        let record = requeue_if_failed(&state, record).await?;
-        return upload_result(&state, record, upload.wait, &upload.response_format).await;
-    }
-
-    let relative_audio = format!("audio/{}{}", upload.sha256, upload.extension);
-    let final_audio = state.config.data_dir.join(&relative_audio);
-    tokio::fs::rename(&upload.temp_path, &final_audio).await?;
-
-    let new_job_id = Uuid::new_v4().to_string();
-    let inserted = db::insert_pending(
-        &state.pool,
-        &new_job_id,
-        &upload.sha256,
-        &upload.model,
-        &upload.language,
-        &relative_audio,
-    )
-    .await?;
-
-    let record = if inserted {
-        state.jobs_changed.notify_waiters();
-        db::find_by_job_id(&state.pool, &new_job_id)
-            .await?
-            .ok_or_else(|| AppError::Internal(anyhow::anyhow!("inserted job disappeared")))?
-    } else {
-        let record = db::find_by_key(&state.pool, &upload.sha256, &upload.model, &upload.language)
-            .await?
-            .ok_or_else(|| AppError::Internal(anyhow::anyhow!("conflicting job disappeared")))?;
-        if record.audio_path.as_deref() != Some(relative_audio.as_str()) {
-            let _ = tokio::fs::remove_file(&final_audio).await;
-        }
-        requeue_if_failed(&state, record).await?
+async fn claim(State(state): State<AppState>) -> Result<Response, AppError> {
+    let Some(record) = db::claim_next(&state.pool).await? else {
+        return Ok(StatusCode::NO_CONTENT.into_response());
     };
-
-    upload_result(&state, record, upload.wait, &upload.response_format).await
-}
-
-async fn upload_result(
-    state: &AppState,
-    record: Transcription,
-    wait: bool,
-    response_format: &str,
-) -> Result<Response, AppError> {
-    if wait && !matches!(record.status.as_str(), "ready" | "failed") {
-        return Ok(job_status_sse(state.clone(), record.job_id));
-    }
-    record_response(state, record, response_format).await
-}
-
-async fn requeue_if_failed(
-    state: &AppState,
-    record: Transcription,
-) -> Result<Transcription, AppError> {
-    if !db::requeue_failed(&state.pool, &record.job_id).await? {
-        return Ok(record);
-    }
     state.jobs_changed.notify_waiters();
-    db::find_by_job_id(&state.pool, &record.job_id)
-        .await?
-        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("requeued job disappeared")))
+    Ok(Json(ClaimedJob {
+        job_id: record.job_id,
+        content_sha256: record.content_sha256,
+        model: record.model,
+        requested_language: record.requested_language,
+    })
+    .into_response())
 }
 
-async fn read_upload(state: &AppState, mut multipart: Multipart) -> Result<Upload, AppError> {
+async fn audio_ready(
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+    Json(request): Json<AudioReadyRequest>,
+) -> Result<StatusCode, AppError> {
+    let record = db::find_by_job_id(&state.pool, &job_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("job not found".into()))?;
+    if request.sha256 != record.content_sha256 {
+        return Err(AppError::BadRequest("sha256 does not match the job".into()));
+    }
+    if record.status == "awaiting_upload" {
+        if !db::mark_audio_ready(&state.pool, &job_id).await? {
+            return Err(AppError::Conflict("job status changed".into()));
+        }
+        state.jobs_changed.notify_waiters();
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    if matches!(record.status.as_str(), "pending" | "processing" | "ready") {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    Err(AppError::Conflict(format!(
+        "job is {}, not awaiting_upload",
+        record.status
+    )))
+}
+
+async fn result(
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+    Json(transcript): Json<Value>,
+) -> Result<StatusCode, AppError> {
+    let record = db::find_by_job_id(&state.pool, &job_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("job not found".into()))?;
+    if record.status == "ready" {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    if record.status != "processing" {
+        return Err(AppError::Conflict(format!(
+            "job is {}, not processing",
+            record.status
+        )));
+    }
+    validate_transcript(&transcript)?;
+
+    let path_language = if record.requested_language.is_empty() {
+        "auto"
+    } else {
+        &record.requested_language
+    };
+    let relative_transcript = format!(
+        "transcripts/{}/{}/{}.json",
+        record.content_sha256, record.model, path_language
+    );
+    let transcript_path = state.config.data_dir.join(&relative_transcript);
+    let transcript_dir = transcript_path
+        .parent()
+        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("transcript path has no parent")))?;
+    tokio::fs::create_dir_all(transcript_dir).await?;
     let temp_path = state
         .config
         .data_dir
         .join("tmp")
-        .join(format!("{}.upload", Uuid::new_v4()));
-    let mut temp_file: Option<File> = None;
-    let mut hasher = Sha256::new();
-    let mut total = 0usize;
-    let mut extension = ".audio".to_owned();
-    let mut supplied_sha256 = None;
-    let mut model = PUBLIC_MODEL_ID.to_owned();
-    let mut language = String::new();
-    let mut response_format = "json".to_owned();
-    let mut wait = false;
+        .join(format!("{job_id}.json.tmp"));
+    let bytes =
+        serde_json::to_vec_pretty(&transcript).map_err(|error| AppError::Internal(error.into()))?;
+    tokio::fs::write(&temp_path, bytes).await?;
+    tokio::fs::rename(&temp_path, &transcript_path).await?;
 
-    loop {
-        let next_field = match multipart.next_field().await {
-            Ok(field) => field,
-            Err(error) => {
-                discard_temp(&mut temp_file, &temp_path).await;
-                return Err(AppError::BadRequest(format!(
-                    "invalid multipart body: {error}"
-                )));
-            }
-        };
-        let Some(mut field) = next_field else {
-            break;
-        };
-        let name = field.name().unwrap_or_default().to_owned();
-        if name == "file" {
-            if temp_file.is_some() {
-                discard_temp(&mut temp_file, &temp_path).await;
-                return Err(AppError::BadRequest("only one file is allowed".into()));
-            }
-            extension = safe_extension(field.file_name());
-            let mut file = File::create(&temp_path).await?;
-            loop {
-                let next_chunk = match field.chunk().await {
-                    Ok(chunk) => chunk,
-                    Err(error) => {
-                        drop(file);
-                        let _ = tokio::fs::remove_file(&temp_path).await;
-                        return Err(AppError::BadRequest(format!("cannot read upload: {error}")));
-                    }
-                };
-                let Some(chunk) = next_chunk else {
-                    break;
-                };
-                total = total.saturating_add(chunk.len());
-                if total > state.config.max_upload_bytes {
-                    drop(file);
-                    let _ = tokio::fs::remove_file(&temp_path).await;
-                    return Err(AppError::PayloadTooLarge(
-                        "audio file exceeds the upload limit".into(),
-                    ));
-                }
-                hasher.update(&chunk);
-                if let Err(error) = file.write_all(&chunk).await {
-                    drop(file);
-                    let _ = tokio::fs::remove_file(&temp_path).await;
-                    return Err(error.into());
-                }
-            }
-            if let Err(error) = file.flush().await {
-                drop(file);
-                let _ = tokio::fs::remove_file(&temp_path).await;
-                return Err(error.into());
-            }
-            temp_file = Some(file);
-            continue;
-        }
-
-        let value = match field.text().await {
-            Ok(value) => value,
-            Err(error) => {
-                discard_temp(&mut temp_file, &temp_path).await;
-                return Err(AppError::BadRequest(format!("invalid form field: {error}")));
-            }
-        };
-        match name.as_str() {
-            "sha256" => supplied_sha256 = Some(value),
-            "model" => model = value,
-            "language" => match normalize_language(&value) {
-                Ok(value) => language = value,
-                Err(error) => {
-                    discard_temp(&mut temp_file, &temp_path).await;
-                    return Err(error);
-                }
-            },
-            "response_format" => response_format = value,
-            "wait" => wait = matches!(value.as_str(), "true" | "1"),
-            _ => {}
-        }
-    }
-
-    if temp_file.is_none() {
-        return Err(AppError::BadRequest("file is required".into()));
-    }
-    drop(temp_file);
-    Ok(Upload {
-        temp_path,
-        sha256: hex::encode(hasher.finalize()),
-        supplied_sha256,
-        extension,
-        model,
+    let duration = transcript.get("duration").and_then(Value::as_f64);
+    let language = transcript
+        .get("language")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    db::mark_ready(
+        &state.pool,
+        &job_id,
+        &relative_transcript,
+        duration,
         language,
-        response_format,
-        wait,
-    })
+    )
+    .await?;
+    state.progress.clear(&job_id);
+    state.jobs_changed.notify_waiters();
+    Ok(StatusCode::NO_CONTENT)
 }
 
-async fn discard_temp(file: &mut Option<File>, path: &std::path::Path) {
-    drop(file.take());
-    let _ = tokio::fs::remove_file(path).await;
+async fn fail(
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+    Json(request): Json<FailRequest>,
+) -> Result<StatusCode, AppError> {
+    let record = db::find_by_job_id(&state.pool, &job_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("job not found".into()))?;
+    if request.reason == "audio_missing" {
+        if record.status == "awaiting_upload" {
+            return Ok(StatusCode::NO_CONTENT);
+        }
+        if record.status != "processing" {
+            return Err(AppError::Conflict(format!(
+                "job is {}, not processing",
+                record.status
+            )));
+        }
+        let expires_at = unix_timestamp() + UPLOAD_TTL_SECONDS;
+        db::return_to_awaiting_upload(&state.pool, &job_id, expires_at).await?;
+    } else if request.reason == "transcription_failed" {
+        if record.status == "failed" {
+            return Ok(StatusCode::NO_CONTENT);
+        }
+        if record.status != "processing" {
+            return Err(AppError::Conflict(format!(
+                "job is {}, not processing",
+                record.status
+            )));
+        }
+        db::mark_failed(
+            &state.pool,
+            &job_id,
+            &request.error.chars().take(2_000).collect::<String>(),
+        )
+        .await?;
+    } else {
+        return Err(AppError::BadRequest("unknown failure reason".into()));
+    }
+    state.progress.clear(&job_id);
+    state.jobs_changed.notify_waiters();
+    Ok(StatusCode::NO_CONTENT)
 }
 
 fn job_status_sse(state: AppState, job_id: String) -> Response {
@@ -416,7 +417,6 @@ async fn record_response(
                 object.insert(
                     "storage".into(),
                     json!({
-                        "audio_path": record.audio_path,
                         "transcript_path": record.transcript_path,
                     }),
                 );
@@ -445,7 +445,25 @@ async fn job_status(state: &AppState, record: &Transcription) -> JobResponse {
     } else {
         None
     };
-    JobResponse::from_record(record, state.progress.get(&record.job_id), queue_position)
+    let mut response =
+        JobResponse::from_record(record, state.progress.get(&record.job_id), queue_position);
+    if record.status == "awaiting_upload"
+        && let Some(expires_at) = record.upload_expires_at
+    {
+        let token = upload_token::sign(
+            &state.config.whisperx_upload_secret,
+            &record.job_id,
+            &record.content_sha256,
+            expires_at,
+        );
+        response.upload_url = Some(format!(
+            "{}/v1/jobs/{}/audio?sha256={}",
+            state.config.whisperx_public_base_url, record.job_id, record.content_sha256
+        ));
+        response.upload_token = Some(token);
+        response.upload_expires_at = Some(expires_at);
+    }
+    response
 }
 
 async fn pending_response(state: &AppState, record: &Transcription) -> Response {
@@ -475,28 +493,282 @@ async fn require_api_key(
     Ok(next.run(request).await)
 }
 
-fn normalize_language(value: &str) -> Result<String, AppError> {
-    let value = value.trim().to_ascii_lowercase();
-    let code = value.split('-').next().unwrap_or_default().to_owned();
-    if code.is_empty() {
-        return Ok(code);
+async fn require_worker_key(
+    State(state): State<AppState>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Result<Response, AppError> {
+    let expected = format!("Bearer {}", state.config.gateway_worker_key);
+    if request
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        != Some(expected.as_str())
+    {
+        return Err(AppError::Unauthorized);
     }
-    if (2..=3).contains(&code.len()) && code.bytes().all(|byte| byte.is_ascii_lowercase()) {
-        return Ok(code);
-    }
-    Err(AppError::BadRequest("invalid language code".into()))
+    Ok(next.run(request).await)
 }
 
-fn safe_extension(filename: Option<&str>) -> String {
-    let Some(extension) = filename
-        .and_then(|name| std::path::Path::new(name).extension())
-        .and_then(|extension| extension.to_str())
-    else {
-        return ".audio".into();
+fn validate_transcript(transcript: &Value) -> Result<(), AppError> {
+    let object = transcript
+        .as_object()
+        .ok_or_else(|| AppError::BadRequest("transcript must be a JSON object".into()))?;
+    if object.get("task").and_then(Value::as_str) != Some("transcribe")
+        || object.get("language").and_then(Value::as_str).is_none()
+        || object.get("text").and_then(Value::as_str).is_none()
+        || object.get("segments").and_then(Value::as_array).is_none()
+    {
+        return Err(AppError::BadRequest(
+            "transcript must contain task, language, text, and segments".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn upload_expired(record: &Transcription) -> bool {
+    record.status == "awaiting_upload"
+        && record
+            .upload_expires_at
+            .is_some_and(|expires_at| expires_at <= unix_timestamp())
+}
+
+fn unix_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{net::SocketAddr, sync::Arc};
+
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode, header::CONTENT_TYPE},
     };
-    if extension.len() <= 10 && extension.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
-        format!(".{}", extension.to_ascii_lowercase())
-    } else {
-        ".audio".into()
+    use serde_json::{Value, json};
+    use tempfile::tempdir;
+    use tokio::sync::Notify;
+    use tower::ServiceExt;
+
+    use crate::{config::Config, db, models::JobProgress};
+
+    use super::{AppState, router};
+
+    const HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const HASH_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[tokio::test]
+    async fn creates_upload_then_claims_and_completes_job() {
+        let directory = tempdir().unwrap();
+        let data_dir = directory.path().to_path_buf();
+        db::prepare_data_dirs(&data_dir).await.unwrap();
+        let pool = db::connect(&format!("sqlite://{}", data_dir.join("test.db").display()))
+            .await
+            .unwrap();
+        let state = AppState {
+            config: Arc::new(Config {
+                bind: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+                database_url: String::new(),
+                data_dir,
+                gateway_api_key: "client-key".into(),
+                gateway_worker_key: "worker-key".into(),
+                whisperx_base_url: "http://whisperx-internal:8000".into(),
+                whisperx_public_base_url: "https://uploads.example.test".into(),
+                whisperx_api_key: "whisperx-key".into(),
+                whisperx_upload_secret: "upload-secret".into(),
+            }),
+            pool,
+            jobs_changed: Arc::new(Notify::new()),
+            progress: JobProgress::default(),
+        };
+        let app = router(state);
+
+        let first = app
+            .clone()
+            .oneshot(json_request(
+                "/v1/audio/lookup",
+                "client-key",
+                json!({"sha256": HASH}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        let first_payload = response_json(first).await;
+        let job_id = first_payload["job_id"].as_str().unwrap().to_owned();
+        assert_eq!(first_payload["status"], "awaiting_upload");
+        assert!(
+            first_payload["upload_url"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("/v1/jobs/{job_id}/audio?sha256={HASH}"))
+        );
+        assert!(
+            first_payload["upload_token"]
+                .as_str()
+                .unwrap()
+                .contains('.')
+        );
+
+        let second = app
+            .clone()
+            .oneshot(json_request(
+                "/v1/audio/lookup",
+                "client-key",
+                json!({"sha256": HASH}),
+            ))
+            .await
+            .unwrap();
+        let second_payload = response_json(second).await;
+        assert_eq!(second_payload["job_id"], job_id);
+
+        let empty_claim = app
+            .clone()
+            .oneshot(json_request(
+                "/v1/internal/worker/claim",
+                "worker-key",
+                json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(empty_claim.status(), StatusCode::NO_CONTENT);
+
+        let ready = app
+            .clone()
+            .oneshot(json_request(
+                &format!("/v1/internal/jobs/{job_id}/audio-ready"),
+                "worker-key",
+                json!({"sha256": HASH}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(ready.status(), StatusCode::NO_CONTENT);
+
+        let claim = app
+            .clone()
+            .oneshot(json_request(
+                "/v1/internal/worker/claim",
+                "worker-key",
+                json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(claim.status(), StatusCode::OK);
+        assert_eq!(response_json(claim).await["job_id"], job_id);
+
+        let result = app
+            .clone()
+            .oneshot(json_request(
+                &format!("/v1/internal/jobs/{job_id}/result"),
+                "worker-key",
+                json!({
+                    "task": "transcribe",
+                    "language": "en",
+                    "duration": 1.5,
+                    "text": "Hello.",
+                    "segments": []
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(result.status(), StatusCode::NO_CONTENT);
+
+        let completed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/jobs/{job_id}"))
+                    .header("authorization", "Bearer client-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(completed.status(), StatusCode::OK);
+        assert_eq!(response_json(completed).await["text"], "Hello.");
+
+        let missing_audio = app
+            .clone()
+            .oneshot(json_request(
+                "/v1/audio/lookup",
+                "client-key",
+                json!({"sha256": HASH_B}),
+            ))
+            .await
+            .unwrap();
+        let missing_audio_job = response_json(missing_audio).await["job_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mismatch = app
+            .clone()
+            .oneshot(json_request(
+                &format!("/v1/internal/jobs/{missing_audio_job}/audio-ready"),
+                "worker-key",
+                json!({"sha256": HASH}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(mismatch.status(), StatusCode::BAD_REQUEST);
+
+        let ready = app
+            .clone()
+            .oneshot(json_request(
+                &format!("/v1/internal/jobs/{missing_audio_job}/audio-ready"),
+                "worker-key",
+                json!({"sha256": HASH_B}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(ready.status(), StatusCode::NO_CONTENT);
+        let claimed = app
+            .clone()
+            .oneshot(json_request(
+                "/v1/internal/worker/claim",
+                "worker-key",
+                json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response_json(claimed).await["job_id"], missing_audio_job);
+
+        let failed = app
+            .clone()
+            .oneshot(json_request(
+                &format!("/v1/internal/jobs/{missing_audio_job}/fail"),
+                "worker-key",
+                json!({"error": "audio not found", "reason": "audio_missing"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(failed.status(), StatusCode::NO_CONTENT);
+        let retry = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/jobs/{missing_audio_job}"))
+                    .header("authorization", "Bearer client-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response_json(retry).await["status"], "awaiting_upload");
+    }
+
+    fn json_request(uri: &str, key: &str, body: Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("authorization", format!("Bearer {key}"))
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    async fn response_json(response: axum::response::Response) -> Value {
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
     }
 }
