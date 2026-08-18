@@ -93,6 +93,51 @@ cargo run --release
 
 The gateway listens on `0.0.0.0:8080` by default.
 
+## Local VM on OrbStack
+
+On an Apple Silicon Mac, create an Ubuntu VM:
+
+```bash
+orb create ubuntu:24.04 transcription-gateway
+orb shell transcription-gateway
+```
+
+OrbStack mounts Mac paths at the same path inside the VM. Run setup from the
+checkout:
+
+```bash
+cd /Users/valkary/Documents/transcription-gateway
+./setup.sh
+```
+
+The setup script:
+
+1. Installs Rust and the required system packages.
+2. Builds the release binary.
+3. Writes `.env` with generated keys if the file does not exist.
+4. Copies `WHISPERX_API_KEY` from the WhisperX checkout.
+5. Writes shared worker secrets into the WhisperX `.env`.
+6. Installs and starts the `transcription-gateway.service` systemd unit.
+
+Create the WhisperX VM first so the gateway can read its API key. On OrbStack,
+the gateway hostname is `transcription-gateway.orb.local`. OrbStack also
+forwards the service to `http://localhost:8080`.
+
+```bash
+set -a
+source .env
+set +a
+
+curl -s "http://transcription-gateway.orb.local:8080/health"
+```
+
+Restart after you edit `.env`:
+
+```bash
+sudo systemctl restart transcription-gateway.service
+sudo journalctl -u transcription-gateway.service -f
+```
+
 ## Client API
 
 All `/v1` client routes require:
